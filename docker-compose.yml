@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  xlsx_aggregator:
+    build: .
+    container_name: xlsx_aggregator
+    environment:
+      - API_TOKEN=supersecrettoken
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
