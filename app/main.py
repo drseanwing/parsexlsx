@@ -1,96 +1,94 @@
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 import pandas as pd
-import io, os, base64
+import io, os, base64, re
 
 API_TOKEN = os.getenv("API_TOKEN", "supersecrettoken")
-
 app = FastAPI(title="XLSX Aggregator API", docs_url=None, redoc_url=None)
-
 
 @app.get("/")
 def root():
     return {"message": "XLSX Aggregator API is running"}
 
-
 @app.post("/aggregate")
 async def aggregate_json(
     authorization: str = Header(...),
-    x_group_by: str = Header(...),
+    x_group_by: str = Header(None),
     body: dict = None
 ):
-    # --- Auth & input validation ---
+    # --- Authorization ---
     if authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Invalid API token")
     if body is None or "file_b64" not in body:
         raise HTTPException(status_code=400, detail="Missing file_b64 in body")
 
-    # --- Decode & read Excel ---
+    # --- Decode ---
     try:
         decoded = base64.b64decode(body["file_b64"])
-        df = None
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 content")
 
-        # Try normal read first (Inpatients layout)
-        try:
-            df = pd.read_excel(io.BytesIO(decoded), engine="openpyxl", header=0)
-        except Exception:
-            df = None
-
-        # If that fails or columns don't look right, scan alternative header rows
-        if df is None or not any(
-            key in " ".join([str(c) for c in df.columns])
-            for key in ["Ward", "Unit", "CurrWardUnit", "Disch Unit", "AdmNo", "URN"]
-        ):
-            for h in range(1, 10):
-                try:
-                    temp = pd.read_excel(io.BytesIO(decoded), engine="openpyxl", header=h)
-                    if any(
-                        key in " ".join([str(c) for c in temp.columns])
-                        for key in ["Ward", "Unit", "CurrWardUnit", "Disch Unit", "AdmNo", "URN"]
-                    ):
-                        df = temp
-                        break
-                except Exception:
-                    continue
-
+    # --- Try reading with multiple header offsets ---
+    df = None
+    try:
+        for h in [0, 1, 2, 3, 4, 5]:
+            temp = pd.read_excel(io.BytesIO(decoded), engine="openpyxl", header=h)
+            cols = [str(c).strip() for c in temp.columns]
+            if any(k in " ".join(cols) for k in ["AdmNo", "URN", "CurrWardUnit", "Disch Unit"]):
+                df = temp
+                break
         if df is None:
             raise ValueError("Could not locate header row")
-
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error reading XLSX: {e}")
 
-    # --- Clean & normalise ---
-    df = df.dropna(how="all")
     df.columns = [str(c).strip() for c in df.columns]
-    id_cols = [c for c in df.columns if "Adm" in c or "URN" in c]
-    if id_cols:
-        df = df[df[id_cols[0]].notna()]
+    df.dropna(how="all", inplace=True)
 
-    # --- Determine report type ---
-    if "Disch Unit" in df.columns:
-        # Deceased
-        df["Unit"] = df["Disch Unit"].astype(str)
-        group_cols = ["Unit"]
-        count_col = "AdmNo" if "AdmNo" in df.columns else df.columns[0]
-
+    # --- Identify Report Type ---
+    if "URN" in df.columns:
+        report_type = "Inpatients"
+    elif "Disch Unit" in df.columns:
+        report_type = "Deceased"
     elif "CurrWardUnit" in df.columns:
-        # Transfers
-        ward_unit = df["CurrWardUnit"].astype(str).str.split(" ", n=1, expand=True)
-        df["Ward"] = ward_unit[0]
-        df["Unit"] = ward_unit[1]
+        report_type = "Transfers"
+    else:
+        report_type = "Unknown"
+
+    # --- Normalise + Grouping ---
+    if report_type == "Inpatients":
+        # Standard inpatient layout
+        df = df[df["Ward"].notna()]
         group_cols = ["Ward", "Unit"]
-        count_col = "AdmNo" if "AdmNo" in df.columns else df.columns[0]
+        count_col = "URN"
+
+    elif report_type == "Deceased":
+        # Row 3 headers, no Ward column
+        df = df[df["AdmNo"].notna()]
+        df["Unit"] = df["Disch Unit"].astype(str)
+        df["Ward"] = None
+        group_cols = ["Unit"]
+        count_col = "AdmNo"
+
+    elif report_type == "Transfers":
+        # Header row ~5, CurrWardUnit like "4A ORTR"
+        df = df[df["CurrWardUnit"].notna()]
+        ward_unit = df["CurrWardUnit"].astype(str).str.split(" ", n=1, expand=True)
+        df["Ward"] = ward_unit[0].str.strip()
+        df["Unit"] = ward_unit[1].str.strip()
+        group_cols = ["Ward", "Unit"]
+        count_col = "AdmNo"
 
     else:
-        # Inpatients (headers at row 1)
-        group_cols = [c.strip() for c in x_group_by.split(",") if c.strip()]
-        count_col = (
-            "URN"
-            if "URN" in df.columns
-            else "AdmNo"
-            if "AdmNo" in df.columns
-            else df.columns[0]
-        )
+        # fallback to x-group-by header
+        if not x_group_by:
+            raise HTTPException(status_code=400, detail="Unknown format and no x-group-by provided")
+        group_cols = [x.strip() for x in x_group_by.split(",")]
+        count_col = df.columns[0]
+
+    # --- Clean up count column ---
+    df[count_col] = df[count_col].astype(str)
+    df = df[df[count_col].str.strip() != ""]
 
     # --- Aggregate ---
     try:
@@ -102,4 +100,16 @@ async def aggregate_json(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error aggregating data: {e}")
 
-    return JSONResponse(content={"data": agg.to_dict(orient="records")})
+    # --- Normalize columns for output ---
+    if "Ward" not in agg.columns:
+        agg["Ward"] = None
+    if "Unit" not in agg.columns:
+        agg["Unit"] = None
+    agg = agg[["Ward", "Unit", "Count"]]
+
+    return JSONResponse(
+        content={
+            "report_type": report_type,
+            "data": agg.to_dict(orient="records")
+        }
+    )
