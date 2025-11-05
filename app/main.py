@@ -1,14 +1,16 @@
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 import pandas as pd
-import io, os, base64, re
+import io, os, base64
 
 API_TOKEN = os.getenv("API_TOKEN", "supersecrettoken")
 app = FastAPI(title="XLSX Aggregator API", docs_url=None, redoc_url=None)
 
+
 @app.get("/")
 def root():
     return {"message": "XLSX Aggregator API is running"}
+
 
 @app.post("/aggregate")
 async def aggregate_json(
@@ -28,20 +30,36 @@ async def aggregate_json(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 content")
 
+    # --- Detect XLS vs XLSX ---
+    excel_bytes = io.BytesIO(decoded)
+    start_bytes = excel_bytes.read(8)
+    excel_bytes.seek(0)
+
+    if start_bytes[:2] == b"PK":
+        engine = "openpyxl"  # XLSX (zip)
+    else:
+        engine = "xlrd"      # Legacy XLS
+
     # --- Try reading with multiple header offsets ---
     df = None
     try:
         for h in [0, 1, 2, 3, 4, 5]:
-            temp = pd.read_excel(io.BytesIO(decoded), engine="openpyxl", header=h)
-            cols = [str(c).strip() for c in temp.columns]
-            if any(k in " ".join(cols) for k in ["AdmNo", "URN", "CurrWardUnit", "Disch Unit"]):
-                df = temp
-                break
+            try:
+                temp = pd.read_excel(excel_bytes, engine=engine, header=h)
+                excel_bytes.seek(0)
+                cols = [str(c).strip() for c in temp.columns]
+                if any(k in " ".join(cols) for k in ["AdmNo", "URN", "CurrWardUnit", "Disch Unit"]):
+                    df = temp
+                    break
+            except Exception:
+                excel_bytes.seek(0)
+                continue
         if df is None:
             raise ValueError("Could not locate header row")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error reading XLSX: {e}")
+        raise HTTPException(status_code=400, detail=f"Error reading XLS/XLSX: {e}")
 
+    # --- Clean up columns ---
     df.columns = [str(c).strip() for c in df.columns]
     df.dropna(how="all", inplace=True)
 
@@ -57,13 +75,11 @@ async def aggregate_json(
 
     # --- Normalise + Grouping ---
     if report_type == "Inpatients":
-        # Standard inpatient layout
         df = df[df["Ward"].notna()]
         group_cols = ["Ward", "Unit"]
         count_col = "URN"
 
     elif report_type == "Deceased":
-        # Row 3 headers, no Ward column
         df = df[df["AdmNo"].notna()]
         df["Unit"] = df["Disch Unit"].astype(str)
         df["Ward"] = None
@@ -71,7 +87,6 @@ async def aggregate_json(
         count_col = "AdmNo"
 
     elif report_type == "Transfers":
-        # Header row ~5, CurrWardUnit like "4A ORTR"
         df = df[df["CurrWardUnit"].notna()]
         ward_unit = df["CurrWardUnit"].astype(str).str.split(" ", n=1, expand=True)
         df["Ward"] = ward_unit[0].str.strip()
@@ -80,7 +95,6 @@ async def aggregate_json(
         count_col = "AdmNo"
 
     else:
-        # fallback to x-group-by header
         if not x_group_by:
             raise HTTPException(status_code=400, detail="Unknown format and no x-group-by provided")
         group_cols = [x.strip() for x in x_group_by.split(",")]
